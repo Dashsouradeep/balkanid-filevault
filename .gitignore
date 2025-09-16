@@ -1,0 +1,20 @@
+# Binaries
+*.exe
+*.out
+*.dll
+*.so
+
+# Go build
+/bin/
+/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.env
