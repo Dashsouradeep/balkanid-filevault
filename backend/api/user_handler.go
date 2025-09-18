@@ -6,79 +6,110 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Dashsouradeep/balkanid-filevault/models"
+	"github.com/Dashsouradeep/balkanid-filevault/backend/models"
+	"github.com/Dashsouradeep/balkanid-filevault/backend/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// UserHandler handles user-related routes
 type UserHandler struct {
-	DB *pgxpool.Pool
+	DB     *pgxpool.Pool
+	Secret string // JWT secret
 }
 
-func (h *UserHandler) GetUsers(w http.ResponseWriter, r *http.Request) {
-	// For now, return dummy data
-	users := []map[string]string{
-		{"id": "1", "username": "admin", "email": "admin@example.com"},
+// Register handles new user registration
+func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(users)
-}
-
-// Register new user
-func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
-	var user models.User
-	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
 
-	hashedPassword, err := utils.HashPassword(user.Password)
+	// Hash the password
+	hashedPassword, err := utils.HashPassword(req.Password)
 	if err != nil {
 		http.Error(w, "Error hashing password", http.StatusInternalServerError)
 		return
 	}
-	user.Password = hashedPassword
 
-	_, err = h.DB.Exec(context.Background(),
-		"INSERT INTO users (username, email, password, role) VALUES ($1, $2, $3, $4)",
-		user.Username, user.Email, user.Password, "user")
+	// Insert into DB
+	_, err = h.DB.Exec(r.Context(),
+		"INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)",
+		req.Username, req.Email, hashedPassword,
+	)
 	if err != nil {
-		http.Error(w, "Error saving user", http.StatusInternalServerError)
-		fmt.Println("DB Error:", err)
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"message": "User registered successfully"})
+	fmt.Fprintf(w, "✅ User registered successfully")
 }
 
-// Login user
+// Login handles user login and JWT issuance
 func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
-	var creds models.User
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
 
-	var dbUser models.User
-	err := h.DB.QueryRow(context.Background(),
-		"SELECT id, password, role FROM users WHERE username=$1 OR email=$2",
-		creds.Username, creds.Email).Scan(&dbUser.ID, &dbUser.Password, &dbUser.Role)
+	var user models.User
+	err := h.DB.QueryRow(r.Context(),
+		"SELECT id, username, email, password_hash FROM users WHERE email=$1", req.Email,
+	).Scan(&user.ID, &user.Username, &user.Email, &user.PasswordHash)
 	if err != nil {
-		http.Error(w, "User not found", http.StatusUnauthorized)
+		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
 		return
 	}
 
-	if !utils.CheckPassword(dbUser.Password, creds.Password) {
-		http.Error(w, "Invalid password", http.StatusUnauthorized)
+	// Compare password
+	if !utils.CheckPasswordHash(req.Password, user.PasswordHash) {
+		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
 		return
 	}
 
-	token, err := utils.GenerateToken(dbUser.ID, dbUser.Role)
+	// Generate JWT
+	token, err := utils.GenerateJWT(user.ID, h.Secret)
 	if err != nil {
 		http.Error(w, "Error generating token", http.StatusInternalServerError)
 		return
 	}
 
+	// Return token as JSON
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
+}
+
+// GetUsers fetches all users (protected route)
+func (h *UserHandler) GetUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.DB.Query(context.Background(),
+		"SELECT id, username, email, created_at FROM users")
+	if err != nil {
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var users []models.User
+	for rows.Next() {
+		var u models.User
+		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.CreatedAt); err != nil {
+			http.Error(w, "Row scan error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		users = append(users, u)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(users)
 }

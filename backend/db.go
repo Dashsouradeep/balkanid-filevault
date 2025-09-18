@@ -5,18 +5,18 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func ConnectDB(cfg Config) *pgx.Conn {
-	url := fmt.Sprintf("postgres://%s:%s@%s:%s/%s",
+func ConnectDB(cfg Config) *pgxpool.Pool {
+	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s",
 		cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName)
 
-	conn, err := pgx.Connect(context.Background(), url)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
-		log.Fatalf("❌ Unable to connect to database: %v\n", err)
+		log.Fatalf("❌ Unable to connect to database: %v", err)
 	}
 
-	fmt.Println("✅ Connected to PostgreSQL database!")
-	return conn
+	log.Println("✅ Connected to PostgreSQL database!")
+	return pool
 }
