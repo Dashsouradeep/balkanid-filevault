@@ -42,12 +42,11 @@ func (h *ShareHandler) ShareFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Insert into shares
-	// Insert into shares (ignore duplicates)
+	// Insert into shares with conflict handling
 	_, err = h.DB.Exec(r.Context(),
-		`INSERT INTO shares (file_id, shared_by, target_user, shared_at, share_type)
-     VALUES ($1, $2, $3, NOW(), 'read')
-     ON CONFLICT (file_id, target_user) DO NOTHING`,
+		`INSERT INTO shares (file_id, shared_by, target_user, shared_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (file_id, shared_by, target_user) DO NOTHING`,
 		req.FileID, userID, req.TargetUser,
 	)
 
