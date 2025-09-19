@@ -26,24 +26,22 @@ func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid input", http.StatusBadRequest)
+		http.Error(w, "❌ Invalid input", http.StatusBadRequest)
 		return
 	}
 
-	// Hash the password
 	hashedPassword, err := utils.HashPassword(req.Password)
 	if err != nil {
-		http.Error(w, "Error hashing password", http.StatusInternalServerError)
+		http.Error(w, "❌ Error hashing password", http.StatusInternalServerError)
 		return
 	}
 
-	// Insert into DB
 	_, err = h.DB.Exec(r.Context(),
-		"INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)",
+		"INSERT INTO users (username, email, password_hash, created_at) VALUES ($1, $2, $3, NOW())",
 		req.Username, req.Email, hashedPassword,
 	)
 	if err != nil {
-		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "❌ Could not create user", http.StatusInternalServerError)
 		return
 	}
 

@@ -20,3 +20,24 @@ func ValidateJWT(tokenStr, secret string) (*jwt.Token, error) {
 		return []byte(secret), nil
 	})
 }
+
+// ExtractToken extracts the JWT token from the Authorization header string
+func ExtractToken(authHeader string) string {
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		return authHeader[7:]
+	}
+	return ""
+}
+
+// ValidateAndGetClaims validates the JWT and returns its claims
+func ValidateAndGetClaims(tokenStr, secret string) (map[string]interface{}, error) {
+	token, err := ValidateJWT(tokenStr, secret)
+	if err != nil || !token.Valid {
+		return nil, err
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, err
+	}
+	return claims, nil
+}
