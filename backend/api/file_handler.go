@@ -46,7 +46,7 @@ func (h *FileHandler) getUserID(r *http.Request) (int, bool) {
 
 // UploadFile - handle file uploads with deduplication
 func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
-	userID, ok := GetUserIDFromToken(r)
+	userID, ok := h.getUserID(r)
 	if !ok {
 		http.Error(w, "❌ Unauthorized", http.StatusUnauthorized)
 		return
@@ -64,6 +64,35 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
+	// Get file size
+	fileSize := handler.Size
+
+	// Check user quota
+	var used, quota int64
+	err = h.DB.QueryRow(r.Context(),
+		`SELECT used_bytes, quota_bytes FROM user_storage WHERE user_id=$1`, userID,
+	).Scan(&used, &quota)
+
+	if err == sql.ErrNoRows {
+		// initialize record if missing
+		_, err = h.DB.Exec(r.Context(),
+			`INSERT INTO user_storage (user_id, used_bytes, quota_bytes) VALUES ($1, 0, 104857600)`,
+			userID)
+		if err != nil {
+			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		used, quota = 0, 104857600
+	} else if err != nil {
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if used+fileSize > quota {
+		http.Error(w, "❌ Storage quota exceeded", http.StatusForbidden)
+		return
+	}
 
 	// Compute SHA-256 hash
 	hasher := sha256.New()
@@ -111,15 +140,24 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update user storage usage
+	_, err = h.DB.Exec(r.Context(),
+		`UPDATE user_storage SET used_bytes = used_bytes + $1 WHERE user_id=$2`,
+		fileSize, userID,
+	)
+	if err != nil {
+		http.Error(w, "DB Error updating storage: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	// Response
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(fmt.Sprintf(`{"message":"✅ File uploaded (deduplication applied)","file_id":%d}`, fileID)))
+	w.Write([]byte(fmt.Sprintf(`{"message":"✅ File uploaded (deduplication + quota enforced)","file_id":%d}`, fileID)))
 }
 
-// GetFiles - list uploaded files for the logged-in user (with hash + ref_count)
 // GetFiles - list uploaded files for the logged-in user
 func (h *FileHandler) GetFiles(w http.ResponseWriter, r *http.Request) {
-	userID, ok := GetUserIDFromToken(r)
+	userID, ok := h.getUserID(r)
 	if !ok {
 		http.Error(w, "❌ Unauthorized", http.StatusUnauthorized)
 		return
@@ -142,8 +180,8 @@ func (h *FileHandler) GetFiles(w http.ResponseWriter, r *http.Request) {
 			&f.UserID,
 			&f.Filename,
 			&f.Filepath,
-			&f.FileHash, // ✅ new field
-			&f.RefCount, // ✅ new field
+			&f.FileHash,
+			&f.RefCount,
 			&f.UploadedAt,
 		); err != nil {
 			http.Error(w, "Scan Error: "+err.Error(), http.StatusInternalServerError)
@@ -156,7 +194,7 @@ func (h *FileHandler) GetFiles(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(files)
 }
 
-// DownloadFile - download a file by ID
+// DownloadFile - download a file by ID (owner or shared)
 func (h *FileHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.getUserID(r)
 	if !ok {
@@ -181,13 +219,103 @@ func (h *FileHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check ownership or shared access
 	if ownerID != userID {
-		http.Error(w, "❌ Forbidden", http.StatusForbidden)
-		return
+		var count int
+		err := h.DB.QueryRow(r.Context(),
+			`SELECT COUNT(*) FROM shares WHERE file_id=$1 AND target_user=$2`,
+			fileID, userID).Scan(&count)
+		if err != nil || count == 0 {
+			http.Error(w, "❌ Forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Disposition", "attachment; filename="+fileName)
 	http.ServeFile(w, r, filepath.Clean(filePath))
+}
+
+// ShareFile - share a file with another user
+func (h *FileHandler) ShareFile(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getUserID(r)
+	if !ok {
+		http.Error(w, "❌ Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		FileID     int    `json:"file_id"`
+		TargetUser int    `json:"target_user"`
+		ShareType  string `json:"share_type"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+
+	// Default share_type if empty
+	if req.ShareType == "" {
+		req.ShareType = "read"
+	}
+
+	// Insert into shares table
+	_, err := h.DB.Exec(r.Context(),
+		`INSERT INTO shares (file_id, owner_id, target_user, share_type, shared_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+		req.FileID, userID, req.TargetUser, req.ShareType,
+	)
+	if err != nil {
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"message":"✅ File shared successfully"}`))
+}
+
+// GetSharedFiles - list files shared *with* the logged-in user
+func (h *FileHandler) GetSharedFiles(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getUserID(r)
+	if !ok {
+		http.Error(w, "❌ Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	rows, err := h.DB.Query(r.Context(),
+		`SELECT f.id, f.user_id, f.filename, f.filepath, f.file_hash, f.ref_count, f.uploaded_at, s.share_type, s.owner_id
+         FROM files f
+         JOIN shares s ON f.id = s.file_id
+         WHERE s.target_user=$1
+         ORDER BY s.shared_at DESC`, userID)
+	if err != nil {
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type SharedFile struct {
+		models.File
+		OwnerID   int    `json:"owner_id"`
+		ShareType string `json:"share_type"`
+	}
+
+	var files []SharedFile
+	for rows.Next() {
+		var sf SharedFile
+		if err := rows.Scan(
+			&sf.ID, &sf.UserID, &sf.Filename, &sf.Filepath,
+			&sf.FileHash, &sf.RefCount, &sf.UploadedAt,
+			&sf.ShareType, &sf.OwnerID,
+		); err != nil {
+			http.Error(w, "Scan Error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		files = append(files, sf)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(files)
 }
 
 // CreateFile ensures the uploads directory exists and creates the file
@@ -196,4 +324,90 @@ func CreateFile(path string) (*os.File, error) {
 		return nil, err
 	}
 	return os.Create(path)
+}
+
+// GET /storage → check quota usage
+func (h *FileHandler) GetStorage(w http.ResponseWriter, r *http.Request) {
+	userID, ok := GetUserIDFromToken(r)
+	if !ok {
+		http.Error(w, "❌ Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var used, quota int64
+	err := h.DB.QueryRow(r.Context(),
+		`SELECT used_bytes, quota_bytes FROM user_storage WHERE user_id=$1`, userID,
+	).Scan(&used, &quota)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "❌ No storage record found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"used_bytes":   used,
+		"quota_bytes":  quota,
+		"percent_used": float64(used) / float64(quota) * 100,
+	})
+}
+
+// DeleteFile - delete a file owned by the user
+func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.getUserID(r)
+	if !ok {
+		http.Error(w, "❌ Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	fileID := vars["id"]
+
+	var ownerID int
+	var filePath string
+	var refCount int
+	err := h.DB.QueryRow(r.Context(),
+		`SELECT user_id, filepath, ref_count FROM files WHERE id=$1`, fileID).
+		Scan(&ownerID, &filePath, &refCount)
+	if err == sql.ErrNoRows {
+		http.Error(w, "❌ File not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Ensure user owns file
+	if ownerID != userID {
+		http.Error(w, "❌ Forbidden", http.StatusForbidden)
+		return
+	}
+
+	if refCount > 1 {
+		// Just decrement ref_count
+		_, err = h.DB.Exec(r.Context(),
+			`UPDATE files SET ref_count = ref_count - 1 WHERE id=$1`, fileID)
+		if err != nil {
+			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// Remove DB row and physical file
+		_, err = h.DB.Exec(r.Context(),
+			`DELETE FROM files WHERE id=$1`, fileID)
+		if err != nil {
+			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			http.Error(w, "❌ Could not delete file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "✅ File deleted successfully"})
 }

@@ -29,7 +29,7 @@ func main() {
 	// Handlers
 	userHandler := &api.UserHandler{DB: conn, Secret: cfg.JWTSecret}
 	fileHandler := &api.FileHandler{DB: conn, Secret: cfg.JWTSecret}
-
+	shareHandler := &api.ShareHandler{DB: conn, Secret: cfg.JWTSecret}
 	// Public routes
 	r.HandleFunc("/register", userHandler.Register).Methods("POST")
 	r.HandleFunc("/login", userHandler.Login).Methods("POST")
@@ -50,6 +50,18 @@ func main() {
 	r.HandleFunc("/files/{id}",
 		api.AuthMiddleware(cfg.JWTSecret, fileHandler.DownloadFile),
 	).Methods("GET")
+
+	r.HandleFunc("/share",
+		api.AuthMiddleware(cfg.JWTSecret, shareHandler.ShareFile),
+	).Methods("POST")
+
+	r.HandleFunc("/shared",
+		api.AuthMiddleware(cfg.JWTSecret, shareHandler.GetSharedFiles),
+	).Methods("GET")
+
+	r.HandleFunc("/files/{id}",
+		api.AuthMiddleware(cfg.JWTSecret, fileHandler.DeleteFile),
+	).Methods("DELETE")
 
 	// Start server
 	fmt.Println("🚀 Server running on http://localhost:8080")

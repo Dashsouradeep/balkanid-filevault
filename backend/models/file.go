@@ -11,3 +11,8 @@ type File struct {
 	RefCount   int       `json:"ref_count"`
 	UploadedAt time.Time `json:"uploaded_at"`
 }
+
+type SharedFile struct {
+	File
+	SharedBy int `json:"shared_by"`
+}
