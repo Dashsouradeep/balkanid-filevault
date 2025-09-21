@@ -52,8 +52,8 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form
-	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10 MB limit
+	// Parse multipart form (max 10MB file size here)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "❌ Could not parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -65,8 +65,13 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Get file size
-	fileSize := handler.Size
+	// Read file into memory
+	fileBytes, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, "❌ Could not read file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fileSize := int64(len(fileBytes))
 
 	// Check user quota
 	var used, quota int64
@@ -75,17 +80,17 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	).Scan(&used, &quota)
 
 	if err == sql.ErrNoRows {
-		// initialize record if missing
+		// initialize record if missing (100 MB quota default)
 		_, err = h.DB.Exec(r.Context(),
 			`INSERT INTO user_storage (user_id, used_bytes, quota_bytes) VALUES ($1, 0, 104857600)`,
 			userID)
 		if err != nil {
-			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "DB Error (init storage): "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		used, quota = 0, 104857600
 	} else if err != nil {
-		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "DB Error (check quota): "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -95,21 +100,12 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Compute SHA-256 hash
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		http.Error(w, "❌ Could not hash file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	fileHash := hex.EncodeToString(hasher.Sum(nil))
+	hash := sha256.Sum256(fileBytes)
+	fileHash := hex.EncodeToString(hash[:])
 
-	// Reset pointer
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		http.Error(w, "❌ Could not reset file pointer: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Save file physically (only if not already present)
-	filePath := "uploads/" + handler.Filename
+	// Save file physically (if not already present)
+	uploadsDir := "uploads"
+	filePath := filepath.Join(uploadsDir, handler.Filename)
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		dst, err := CreateFile(filePath)
 		if err != nil {
@@ -118,25 +114,37 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		}
 		defer dst.Close()
 
-		if _, err := io.Copy(dst, file); err != nil {
+		if _, err := dst.Write(fileBytes); err != nil {
 			http.Error(w, "❌ Could not write file: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 
-	// Insert or update ref_count in DB
 	var fileID int
-	err = h.DB.QueryRow(r.Context(),
-		`INSERT INTO files (user_id, filename, filepath, file_hash, ref_count, uploaded_at)
+	rows, err := h.DB.Query(r.Context(),
+		`WITH upsert AS (
+		 INSERT INTO files (user_id, filename, filepath, file_hash, ref_count, uploaded_at)
 		 VALUES ($1, $2, $3, $4, 1, NOW())
 		 ON CONFLICT (file_hash) DO UPDATE 
 		 SET ref_count = files.ref_count + 1
-		 RETURNING id`,
+		 RETURNING id
+	 )
+	 SELECT id FROM upsert`,
 		userID, handler.Filename, filePath, fileHash,
-	).Scan(&fileID)
-
+	)
 	if err != nil {
-		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "DB Error (insert file query): "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		if err := rows.Scan(&fileID); err != nil {
+			http.Error(w, "DB Error (scan id): "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		http.Error(w, "DB Error: no id returned from insert", http.StatusInternalServerError)
 		return
 	}
 
@@ -146,13 +154,15 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		fileSize, userID,
 	)
 	if err != nil {
-		http.Error(w, "DB Error updating storage: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "DB Error (update storage): "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Response
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(fmt.Sprintf(`{"message":"✅ File uploaded (deduplication + quota enforced)","file_id":%d}`, fileID)))
+	w.Write([]byte(fmt.Sprintf(
+		`{"message":"✅ File uploaded (deduplication + quota enforced)","file_id":%d}`, fileID,
+	)))
 }
 
 // GetFiles - list uploaded files for the logged-in user
@@ -164,8 +174,16 @@ func (h *FileHandler) GetFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.DB.Query(r.Context(),
-		`SELECT id, user_id, filename, filepath, file_hash, ref_count, uploaded_at
-         FROM files WHERE user_id=$1 ORDER BY uploaded_at DESC`, userID)
+		`SELECT id,
+		        COALESCE(user_id, 0) AS user_id,
+		        filename,
+		        COALESCE(filepath, '') AS filepath,
+		        file_hash,
+		        COALESCE(ref_count, 0) AS ref_count,
+		        uploaded_at
+		 FROM files
+		 WHERE user_id = $1
+		 ORDER BY uploaded_at DESC`, userID)
 	if err != nil {
 		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
 		return

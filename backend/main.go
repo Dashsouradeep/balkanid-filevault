@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/Dashsouradeep/balkanid-filevault/backend/api"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 )
 
@@ -30,6 +31,7 @@ func main() {
 	userHandler := &api.UserHandler{DB: conn, Secret: cfg.JWTSecret}
 	fileHandler := &api.FileHandler{DB: conn, Secret: cfg.JWTSecret}
 	shareHandler := &api.ShareHandler{DB: conn, Secret: cfg.JWTSecret}
+
 	// Public routes
 	r.HandleFunc("/register", userHandler.Register).Methods("POST")
 	r.HandleFunc("/login", userHandler.Login).Methods("POST")
@@ -63,7 +65,14 @@ func main() {
 		api.AuthMiddleware(cfg.JWTSecret, fileHandler.DeleteFile),
 	).Methods("DELETE")
 
+	r.HandleFunc("/register", userHandler.Register).Methods("POST")
+
+	// Add handlers
+	headersOk := handlers.AllowedHeaders([]string{"Authorization", "Content-Type"})
+	originsOk := handlers.AllowedOrigins([]string{"*"})
+	methodsOk := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
+
 	// Start server
 	fmt.Println("🚀 Server running on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServe(":8080", handlers.CORS(originsOk, headersOk, methodsOk)(r)))
 }
