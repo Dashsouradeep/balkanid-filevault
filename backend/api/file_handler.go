@@ -14,6 +14,7 @@ import (
 	"github.com/Dashsouradeep/balkanid-filevault/backend/models"
 	"github.com/Dashsouradeep/balkanid-filevault/backend/utils"
 	"github.com/gorilla/mux"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -44,7 +45,9 @@ func (h *FileHandler) getUserID(r *http.Request) (int, bool) {
 	return int(userID), true
 }
 
-// UploadFile - handle file uploads with deduplication
+// UploadFile - handle file uploads with deduplication + quota
+// UploadFile - handle file uploads with deduplication + quota
+// UploadFile - handle file uploads with deduplication + quota
 func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.getUserID(r)
 	if !ok {
@@ -52,7 +55,7 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form (max 10MB file size here)
+	// Parse multipart form (max 10MB here, adjust as needed)
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "❌ Could not parse form: "+err.Error(), http.StatusBadRequest)
 		return
@@ -73,27 +76,30 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	fileSize := int64(len(fileBytes))
 
-	// Check user quota
+	// ✅ Check / initialize user quota
 	var used, quota int64
 	err = h.DB.QueryRow(r.Context(),
 		`SELECT used_bytes, quota_bytes FROM user_storage WHERE user_id=$1`, userID,
 	).Scan(&used, &quota)
 
-	if err == sql.ErrNoRows {
-		// initialize record if missing (100 MB quota default)
-		_, err = h.DB.Exec(r.Context(),
-			`INSERT INTO user_storage (user_id, used_bytes, quota_bytes) VALUES ($1, 0, 104857600)`,
-			userID)
-		if err != nil {
-			http.Error(w, "DB Error (init storage): "+err.Error(), http.StatusInternalServerError)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Auto-create record with 100MB quota
+			_, err = h.DB.Exec(r.Context(),
+				`INSERT INTO user_storage (user_id, used_bytes, quota_bytes) VALUES ($1, 0, 104857600)`,
+				userID)
+			if err != nil {
+				http.Error(w, "DB Error (init storage): "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			used, quota = 0, 104857600
+		} else {
+			http.Error(w, "DB Error (check quota): "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		used, quota = 0, 104857600
-	} else if err != nil {
-		http.Error(w, "DB Error (check quota): "+err.Error(), http.StatusInternalServerError)
-		return
 	}
 
+	// ✅ Enforce quota
 	if used+fileSize > quota {
 		http.Error(w, "❌ Storage quota exceeded", http.StatusForbidden)
 		return
@@ -104,8 +110,7 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	fileHash := hex.EncodeToString(hash[:])
 
 	// Save file physically (if not already present)
-	uploadsDir := "uploads"
-	filePath := filepath.Join(uploadsDir, handler.Filename)
+	filePath := "uploads/" + handler.Filename
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		dst, err := CreateFile(filePath)
 		if err != nil {
@@ -120,35 +125,23 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// ✅ Insert or update file metadata, store size
 	var fileID int
-	rows, err := h.DB.Query(r.Context(),
-		`WITH upsert AS (
-		 INSERT INTO files (user_id, filename, filepath, file_hash, ref_count, uploaded_at)
-		 VALUES ($1, $2, $3, $4, 1, NOW())
+	err = h.DB.QueryRow(r.Context(),
+		`INSERT INTO files (user_id, filename, filepath, file_hash, ref_count, uploaded_at, size)
+		 VALUES ($1, $2, $3, $4, 1, NOW(), $5)
 		 ON CONFLICT (file_hash) DO UPDATE 
 		 SET ref_count = files.ref_count + 1
-		 RETURNING id
-	 )
-	 SELECT id FROM upsert`,
-		userID, handler.Filename, filePath, fileHash,
-	)
+		 RETURNING id`,
+		userID, handler.Filename, filePath, fileHash, fileSize,
+	).Scan(&fileID)
+
 	if err != nil {
-		http.Error(w, "DB Error (insert file query): "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		if err := rows.Scan(&fileID); err != nil {
-			http.Error(w, "DB Error (scan id): "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	} else {
-		http.Error(w, "DB Error: no id returned from insert", http.StatusInternalServerError)
+		http.Error(w, "DB Error (insert file): "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Update user storage usage
+	// ✅ Update storage usage
 	_, err = h.DB.Exec(r.Context(),
 		`UPDATE user_storage SET used_bytes = used_bytes + $1 WHERE user_id=$2`,
 		fileSize, userID,
@@ -158,7 +151,7 @@ func (h *FileHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Response
+	// ✅ Response
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(fmt.Sprintf(
 		`{"message":"✅ File uploaded (deduplication + quota enforced)","file_id":%d}`, fileID,
@@ -301,11 +294,13 @@ func (h *FileHandler) GetSharedFiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.DB.Query(r.Context(),
-		`SELECT f.id, f.user_id, f.filename, f.filepath, f.file_hash, f.ref_count, f.uploaded_at, s.share_type, s.owner_id
+		`SELECT f.id, f.user_id, f.filename, f.filepath, f.file_hash, f.ref_count, f.uploaded_at,
+                s.share_type, s.shared_by
          FROM files f
          JOIN shares s ON f.id = s.file_id
          WHERE s.target_user=$1
          ORDER BY s.shared_at DESC`, userID)
+
 	if err != nil {
 		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -314,7 +309,7 @@ func (h *FileHandler) GetSharedFiles(w http.ResponseWriter, r *http.Request) {
 
 	type SharedFile struct {
 		models.File
-		OwnerID   int    `json:"owner_id"`
+		SharedBy  int    `json:"shared_by"`
 		ShareType string `json:"share_type"`
 	}
 
@@ -324,7 +319,7 @@ func (h *FileHandler) GetSharedFiles(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(
 			&sf.ID, &sf.UserID, &sf.Filename, &sf.Filepath,
 			&sf.FileHash, &sf.RefCount, &sf.UploadedAt,
-			&sf.ShareType, &sf.OwnerID,
+			&sf.ShareType, &sf.SharedBy, // ✅ fixed mapping
 		); err != nil {
 			http.Error(w, "Scan Error: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -345,6 +340,7 @@ func CreateFile(path string) (*os.File, error) {
 }
 
 // GET /storage → check quota usage
+// GET /storage → check quota usage
 func (h *FileHandler) GetStorage(w http.ResponseWriter, r *http.Request) {
 	userID, ok := GetUserIDFromToken(r)
 	if !ok {
@@ -357,12 +353,21 @@ func (h *FileHandler) GetStorage(w http.ResponseWriter, r *http.Request) {
 		`SELECT used_bytes, quota_bytes FROM user_storage WHERE user_id=$1`, userID,
 	).Scan(&used, &quota)
 
-	if err == sql.ErrNoRows {
-		http.Error(w, "❌ No storage record found", http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
-		return
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// ✅ Auto-create record with 100MB quota
+			_, err = h.DB.Exec(r.Context(),
+				`INSERT INTO user_storage (user_id, used_bytes, quota_bytes) VALUES ($1, 0, 104857600)`,
+				userID)
+			if err != nil {
+				http.Error(w, "DB Error (init storage): "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			used, quota = 0, 104857600
+		} else {
+			http.Error(w, "DB Error (check quota): "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -372,6 +377,7 @@ func (h *FileHandler) GetStorage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// DeleteFile - delete a file owned by the user
 // DeleteFile - delete a file owned by the user
 func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.getUserID(r)
@@ -386,10 +392,14 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	var ownerID int
 	var filePath string
 	var refCount int
+	var fileSize int64
+
+	// ✅ Get file info including size
 	err := h.DB.QueryRow(r.Context(),
-		`SELECT user_id, filepath, ref_count FROM files WHERE id=$1`, fileID).
-		Scan(&ownerID, &filePath, &refCount)
-	if err == sql.ErrNoRows {
+		`SELECT user_id, filepath, ref_count, size FROM files WHERE id=$1`, fileID).
+		Scan(&ownerID, &filePath, &refCount, &fileSize)
+
+	if err == pgx.ErrNoRows {
 		http.Error(w, "❌ File not found", http.StatusNotFound)
 		return
 	} else if err != nil {
@@ -408,7 +418,7 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		_, err = h.DB.Exec(r.Context(),
 			`UPDATE files SET ref_count = ref_count - 1 WHERE id=$1`, fileID)
 		if err != nil {
-			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "DB Error (decrement ref_count): "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	} else {
@@ -416,7 +426,7 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		_, err = h.DB.Exec(r.Context(),
 			`DELETE FROM files WHERE id=$1`, fileID)
 		if err != nil {
-			http.Error(w, "DB Error: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "DB Error (delete file): "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -424,6 +434,16 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "❌ Could not delete file: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+	}
+
+	// ✅ Subtract file size from quota
+	_, err = h.DB.Exec(r.Context(),
+		`UPDATE user_storage SET used_bytes = GREATEST(used_bytes - $1, 0) WHERE user_id=$2`,
+		fileSize, userID,
+	)
+	if err != nil {
+		http.Error(w, "DB Error (update storage): "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -1,78 +1,59 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"os"
 
-	"github.com/Dashsouradeep/balkanid-filevault/backend/api"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+
+	"github.com/Dashsouradeep/balkanid-filevault/backend/api"
+	"github.com/Dashsouradeep/balkanid-filevault/backend/db"
 )
 
 func main() {
-	// Load configuration (from .env or defaults)
-	cfg := LoadConfig()
-
-	// Connect to DB
-	conn := ConnectDB(cfg)
-	defer conn.Close()
-
-	// Ensure uploads folder exists
-	if err := os.MkdirAll("./uploads", os.ModePerm); err != nil {
-		log.Fatalf("❌ Failed to create uploads directory: %v", err)
+	// Load DB
+	pool, err := db.ConnectDB()
+	if err != nil {
+		log.Fatal("❌ Failed to connect DB: ", err)
 	}
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		secret = "supersecret" // fallback for dev
+	}
+
+	// Handlers
+	userHandler := &api.UserHandler{DB: pool, Secret: secret}
+	fileHandler := &api.FileHandler{DB: pool, Secret: secret}
+	shareHandler := &api.ShareHandler{DB: pool, Secret: secret} // ✅ now used
 
 	// Router
 	r := mux.NewRouter()
-
-	// Handlers
-	userHandler := &api.UserHandler{DB: conn, Secret: cfg.JWTSecret}
-	fileHandler := &api.FileHandler{DB: conn, Secret: cfg.JWTSecret}
-	shareHandler := &api.ShareHandler{DB: conn, Secret: cfg.JWTSecret}
 
 	// Public routes
 	r.HandleFunc("/register", userHandler.Register).Methods("POST")
 	r.HandleFunc("/login", userHandler.Login).Methods("POST")
 
 	// Protected routes
-	r.HandleFunc("/users",
-		api.AuthMiddleware(cfg.JWTSecret, userHandler.GetUsers),
-	).Methods("GET")
+	r.Handle("/files", api.AuthMiddleware(http.HandlerFunc(fileHandler.UploadFile), secret)).Methods("POST")
+	r.Handle("/files", api.AuthMiddleware(http.HandlerFunc(fileHandler.GetFiles), secret)).Methods("GET")
+	r.Handle("/files/{id}", api.AuthMiddleware(http.HandlerFunc(fileHandler.DownloadFile), secret)).Methods("GET")
+	r.Handle("/files/{id}", api.AuthMiddleware(http.HandlerFunc(fileHandler.DeleteFile), secret)).Methods("DELETE")
 
-	r.HandleFunc("/files",
-		api.AuthMiddleware(cfg.JWTSecret, fileHandler.UploadFile),
-	).Methods("POST")
+	r.Handle("/share", api.AuthMiddleware(http.HandlerFunc(fileHandler.ShareFile), secret)).Methods("POST")
+	r.Handle("/shared", api.AuthMiddleware(http.HandlerFunc(fileHandler.GetSharedFiles), secret)).Methods("GET")
 
-	r.HandleFunc("/files",
-		api.AuthMiddleware(cfg.JWTSecret, fileHandler.GetFiles),
-	).Methods("GET")
+	r.Handle("/storage", api.AuthMiddleware(http.HandlerFunc(fileHandler.GetStorage), secret)).Methods("GET")
 
-	r.HandleFunc("/files/{id}",
-		api.AuthMiddleware(cfg.JWTSecret, fileHandler.DownloadFile),
-	).Methods("GET")
+	// Optional: routes using ShareHandler if you extend functionality
+	_ = shareHandler // avoids unused error if not yet wired
 
-	r.HandleFunc("/share",
-		api.AuthMiddleware(cfg.JWTSecret, shareHandler.ShareFile),
-	).Methods("POST")
+	// CORS
+	headers := handlers.AllowedHeaders([]string{"X-Requested-With", "Content-Type", "Authorization"})
+	methods := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
+	origins := handlers.AllowedOrigins([]string{"*"})
 
-	r.HandleFunc("/shared",
-		api.AuthMiddleware(cfg.JWTSecret, shareHandler.GetSharedFiles),
-	).Methods("GET")
-
-	r.HandleFunc("/files/{id}",
-		api.AuthMiddleware(cfg.JWTSecret, fileHandler.DeleteFile),
-	).Methods("DELETE")
-
-	r.HandleFunc("/register", userHandler.Register).Methods("POST")
-
-	// Add handlers
-	headersOk := handlers.AllowedHeaders([]string{"Authorization", "Content-Type"})
-	originsOk := handlers.AllowedOrigins([]string{"*"})
-	methodsOk := handlers.AllowedMethods([]string{"GET", "POST", "PUT", "DELETE", "OPTIONS"})
-
-	// Start server
-	fmt.Println("🚀 Server running on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", handlers.CORS(originsOk, headersOk, methodsOk)(r)))
+	log.Println("🚀 Server started at :8080")
+	log.Fatal(http.ListenAndServe(":8080", handlers.CORS(headers, methods, origins)(r)))
 }

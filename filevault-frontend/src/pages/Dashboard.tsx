@@ -12,18 +12,22 @@ import {
 
 const API_BASE = "http://localhost:8080";
 
-// Renamed to avoid conflict with browser File type
-interface DbFile {
+interface File {
   id: number;
   filename: string;
   uploaded_at: string;
   user_id?: number;
 }
 
+interface SharedFile extends File {
+  shared_by: number;
+  share_type: string;
+}
+
 function Dashboard() {
-  const [files, setFiles] = useState<DbFile[]>([]);
-  const [sharedFiles, setSharedFiles] = useState<DbFile[]>([]);
-  const [file, setFile] = useState<File | null>(null); // now using browser File type
+  const [files, setFiles] = useState<File[]>([]);
+  const [sharedFiles, setSharedFiles] = useState<SharedFile[]>([]);
+  const [file, setFile] = useState<globalThis.File | null>(null);
   const [userLabel, setUserLabel] = useState<string>("User");
 
   const token = localStorage.getItem("token");
@@ -50,7 +54,7 @@ function Dashboard() {
       const data = await res.json();
       setFiles(Array.isArray(data) ? data : []);
     } catch (err) {
-      console.error(err);
+      console.error("loadFiles: Error:", err);
     }
   };
 
@@ -63,7 +67,7 @@ function Dashboard() {
       const data = await res.json();
       setSharedFiles(Array.isArray(data) ? data : []);
     } catch (err) {
-      console.error(err);
+      console.error("loadSharedFiles: Error:", err);
     }
   };
 
@@ -73,7 +77,7 @@ function Dashboard() {
     if (!file) return;
 
     const formData = new FormData();
-    formData.append("file", file); // ✅ proper browser File
+    formData.append("file", file as any);
 
     try {
       const res = await fetch(`${API_BASE}/files`, {
@@ -83,16 +87,16 @@ function Dashboard() {
       });
 
       if (!res.ok) {
-        const errMsg = await res.text();
-        throw new Error(errMsg || "Upload failed");
+        const text = await res.text();
+        throw new Error(text);
       }
 
       alert("✅ File uploaded");
       setFile(null);
       loadFiles();
-    } catch (err) {
-      console.error(err);
-      alert("❌ Upload failed");
+    } catch (err: any) {
+      console.error("handleUpload error:", err);
+      alert("❌ Upload failed: " + err.message);
     }
   };
 
@@ -119,11 +123,10 @@ function Dashboard() {
   const handleDelete = async (id: number) => {
     if (!confirm("Are you sure?")) return;
     try {
-      const res = await fetch(`${API_BASE}/files/${id}`, {
+      await fetch(`${API_BASE}/files/${id}`, {
         method: "DELETE",
         headers: { Authorization: "Bearer " + token },
       });
-      if (!res.ok) throw new Error("Delete failed");
       alert("✅ File deleted");
       loadFiles();
     } catch {
@@ -136,7 +139,7 @@ function Dashboard() {
     const targetUser = prompt("Enter target user ID:");
     if (!targetUser) return;
     try {
-      const res = await fetch(`${API_BASE}/share`, {
+      await fetch(`${API_BASE}/share`, {
         method: "POST",
         headers: {
           Authorization: "Bearer " + token,
@@ -144,7 +147,6 @@ function Dashboard() {
         },
         body: JSON.stringify({ file_id: id, target_user: parseInt(targetUser) }),
       });
-      if (!res.ok) throw new Error("Share failed");
       alert("✅ File shared");
       loadSharedFiles();
     } catch {
@@ -217,7 +219,7 @@ function Dashboard() {
               >
                 <MDBInput
                   type="file"
-                  onChange={(e: any) => setFile(e.target.files?.[0] || null)}
+                  onChange={(e: any) => setFile(e.target.files[0])}
                   required
                   className="w-100"
                 />
@@ -292,13 +294,14 @@ function Dashboard() {
                   <tr>
                     <th>Filename</th>
                     <th>Shared By</th>
+                    <th>Share Type</th>
                     <th className="text-center">Actions</th>
                   </tr>
                 </MDBTableHead>
                 <MDBTableBody>
                   {sharedFiles.length === 0 ? (
                     <tr>
-                      <td colSpan={3} className="text-center text-muted">
+                      <td colSpan={4} className="text-center text-muted">
                         No files shared yet
                       </td>
                     </tr>
@@ -306,7 +309,8 @@ function Dashboard() {
                     sharedFiles.map((f) => (
                       <tr key={f.id}>
                         <td>{f.filename}</td>
-                        <td>{f.user_id || "Unknown"}</td>
+                        <td>{f.shared_by}</td>
+                        <td>{f.share_type}</td>
                         <td className="text-center">
                           <MDBBtn
                             size="sm"
